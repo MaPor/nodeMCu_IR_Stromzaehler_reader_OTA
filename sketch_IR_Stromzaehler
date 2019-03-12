@@ -1,0 +1,430 @@
+
+//Stromzähler IP 138
+//Geflasht am 21.11.2017 20:52
+//Geflasht am 13.12.2017 08:12
+//Abgestürtzt am 7.1.2018 08:12 bei 2.153.953.760
+//Abgestürtzt am 1.2.2018 bei 2.150.416.523
+//Abgestürtzt am 14.2.2018 bei 1.028.xxx.xxx
+
+
+// Guter Init aktuell:
+  // Es wird folgender String erwartet
+  // thres_1:thres_2:zahler_gesamt_kwh:nachkomma(4):update_rate
+// mosquitto_pub -t "fhem/power/input" -m "75:110:64493:1100:5000"
+//bitte 4 stelliger nachkommastellen // am Zähler 64500,1 bedeutet  1000
+
+//Änderung 15.10.2018: // mosquitto_pub -t "fhem/power/input" -m "75:9999:68506:1100:5000" 
+//Änderung 15.10.2018: // mosquitto_pub -t "fhem/power/input" -m "egal:eta:zähler vorkomma:zähler nachkomma:update" 
+#include <EEPROM.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+
+const char* ssid = "+++";
+const char* password = "+++";
+IPAddress ip(127, 0, 0, 1);
+IPAddress server(192,168,178,107);
+
+WiFiClient espClient3;
+PubSubClient client(espClient3);
+
+//Init-Werte hier eingeben //////////////
+int thres_1 = 80;//10; //60;  // below thres_1 red mark is in front of sensor
+int thres_2 = 110;//300; //70;  // more than thres_2 red mark is not in front of sensor
+long stromzaehler_overall_kwh = 68506;
+long stromzaehler_overall_nachkomma = 5000;
+int debug_cycle=5000;
+//////////////////////////////////////////
+
+String zaehler; 
+static char verbrauch[15];
+
+//NodeMCU has weird pin mapping.
+//static const uint8_t D0   = 16;
+//static const uint8_t D1   = 5;
+//static const uint8_t D2   = 4;
+//static const uint8_t D3   = 0;
+//static const uint8_t D4   = 2;
+//static const uint8_t D5   = 14;
+//static const uint8_t D6   = 12;
+//static const uint8_t D7   = 13;
+//static const uint8_t D8   = 15;
+//static const uint8_t D9   = 3;
+//static const uint8_t D10  = 1;
+const int analogInPin = 0;  // Analog input pin that the photo transistor is attached to
+const int irOutPin = 4; // Digital output pin that the IR-LED is attached to
+const int LED_green = 12;
+const int LED_red = 5;
+const int LED_blue = 0;
+const int LED_yellow = 2;
+
+int sensorValueOff = 0;  // value read from the photo transistor when ir LED is off
+int sensorValueOn = 0;  // value read from the photo transistor when ir LED is on
+
+
+bool red_mark_memory = 0;   //  silber -> gesucht wird erstes auftauchen von rot
+unsigned long redmark_last_millis=0;
+unsigned long delta_redmark=0;
+float verbrauch_aktuell=0;
+
+
+unsigned long lastReconnectAttempt = 0;
+unsigned long previousMillis = 0; //Zählervariable, zählt Millisekunden seit dem letzten Funktionsaufruf nach oben
+const long interval = 5000; //120000 Millisekunden aka 120 Sekunden, das Interval wie oft der Sensor überhaupt benutzt wird
+
+
+//Float to be stored in EEPROM
+//float f_eeprom = 0.0f;
+//float f_eeprom2 = 0.0f;
+int eeAddress = 0;
+
+//Gleitender Mittelwert
+float ETA=0.9999; // ETA nimm soviel Prozent vom Modell (gl. Durchschnitt)
+float Mittelwert_silber = 200;  // vorher init 300: nicht so gut. löst oft aus, da delta von 30 drunter abgefragt wird
+float Output = 300;
+
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  //payload[length]='\0';
+  //stromzaehler_overall = String((char*)payload);
+  //Serial.println(stromzaehler_overall);
+  
+  Serial.print("Message power arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  
+  for (int i=0;i<length;i++) {
+    char receivedChar = (char)payload[i];
+    Serial.print(receivedChar);
+    //if (receivedChar == '0')
+    //  Serial.print("Null");
+    //if (receivedChar == '1')
+    //  Serial.print("Eins");
+  }
+  Serial.println();
+  
+  payload[length]='\0';
+
+  // Es wird folgender String erwartet
+  // thres_1:thres_2:zahler_gesamt:update_rate
+  // Bsp
+  // 50:70:65678.3:100
+  //mosquitto_pub -t "fhem/power/input" -m "20:110:4444.0:15"
+
+  
+  String myString = String((char*)payload);
+  String s1 = getValue(myString, ':', 0);
+  String s2 = getValue(myString, ':', 1);
+  String s3 = getValue(myString, ':', 2);
+  String s4 = getValue(myString, ':', 3);
+  String s5 = getValue(myString, ':', 4);
+  Serial.println("S1: " + s1);
+  Serial.println("S2: " + s2);
+  Serial.println("S3: " + s3);
+  Serial.println("S4: " + s4);
+  Serial.println("S5: " + s5);
+
+  ETA = (float)atoi(s2.c_str()) / (float)10000 ;
+  //thres_1 = atoi(s1.c_str());
+  //thres_2 = atoi(s2.c_str());
+  stromzaehler_overall_kwh = atoi(s3.c_str());
+  stromzaehler_overall_nachkomma = atoi(s4.c_str());
+  debug_cycle = atoi(s5.c_str());  
+  
+  Serial.println(thres_1);
+  Serial.println(thres_2);
+  Serial.println(stromzaehler_overall_kwh);
+  Serial.println(stromzaehler_overall_nachkomma);
+  Serial.println(debug_cycle);
+  delay(2000);
+  
+  EEPROM.begin(512);
+  EEPROM.put(0, thres_1);
+  EEPROM.put(20, thres_2);
+  EEPROM.put(40, stromzaehler_overall_kwh);
+  EEPROM.put(50, stromzaehler_overall_nachkomma);
+  EEPROM.put(60, debug_cycle);
+  Serial.println("Written to EEPROM!");
+  //Serial.print("Wrote "); Serial.println(flt_stromzaehler_overall);
+  EEPROM.end();
+}
+
+String getValue(String data, char separator, int index)
+{
+    int found = 0;
+    int strIndex[] = { 0, -1 };
+    int maxIndex = data.length() - 1;
+
+    for (int i = 0; i <= maxIndex && found <= index; i++) {
+        if (data.charAt(i) == separator || i == maxIndex) {
+            found++;
+            strIndex[0] = strIndex[1] + 1;
+            strIndex[1] = (i == maxIndex) ? i+1 : i;
+        }
+    }
+    return found > index ? data.substring(strIndex[0], strIndex[1]) : "";
+}
+
+
+
+
+boolean reconnect() {
+    if (client.connect("arduinoClient","fhem/power/mqtt_status",0,true,"offline")) {
+      Serial.println("re-connected");
+      // Once connected, publish an announcement...
+      client.publish("fhem/power/set","Reconnect: hello world from powermeter",true);
+      // ... and resubscribe
+      client.subscribe("fhem/power/input");
+      //client.loop();
+    }
+    return client.connected();
+}
+
+void setup() {
+  // put your setup code here, to run once:
+    Serial.begin(115200);
+    delay(50);
+
+   // Connect to WiFi network
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+ 
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+ 
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi Power connected");
+
+  client.setServer(server, 1883);
+  client.setCallback(callback);
+
+  lastReconnectAttempt = 0;
+  
+  // initialize the digital pins as an output.
+  pinMode(irOutPin, OUTPUT);
+  pinMode(LED_green, OUTPUT);
+  pinMode(LED_red, OUTPUT);
+  pinMode(LED_blue, OUTPUT);
+  pinMode(LED_yellow, OUTPUT);
+
+  // Port defaults to 8266
+  // ArduinoOTA.setPort(8266);
+
+  // Hostname defaults to esp8266-[ChipID]
+  // ArduinoOTA.setHostname("myesp8266");
+
+  // No authentication by default
+  // ArduinoOTA.setPassword((const char *)"123");
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+  Serial.println("Ready");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+
+// Für Flashing over the Air
+ArduinoOTA.handle();
+//////////////////
+unsigned long currentMillis = millis(); 
+
+//if (millis() % 100 == 0) {
+//    Serial.print("Millis "); Serial.println(millis());
+//    Serial.print("Flt_Stromzähler "); Serial.println(flt_stromzaehler_overall);
+//}
+    if (!client.connected()) {
+        //long now = millis();
+        if (currentMillis - lastReconnectAttempt > 5000) {
+          lastReconnectAttempt = currentMillis;
+          // Attempt to reconnect
+          if (reconnect()) {
+            lastReconnectAttempt = 0;
+          }
+        }
+      } else {
+        // Client connected
+    
+        client.loop();
+      }
+
+
+    
+    //Bei erstem Startup wird Init Wert aus EEPROM geholt
+    if (stromzaehler_overall_kwh< 1) {
+      EEPROM.begin(512);
+      EEPROM.get(0, thres_1);
+      EEPROM.get(20, thres_1);
+      EEPROM.get(40, stromzaehler_overall_kwh);
+      EEPROM.get(50, stromzaehler_overall_nachkomma);
+      EEPROM.get(60, debug_cycle);
+      Serial.print("Read "); Serial.print(stromzaehler_overall_kwh);Serial.print("."); Serial.println(stromzaehler_overall_nachkomma);
+      EEPROM.commit();
+      EEPROM.end();
+      delay(1500);
+    }
+
+
+  
+    
+
+// Anfang: Messung mit IR Sensorik am Ferraris Zähler    
+    // perform measurement, turn IR LED off
+    digitalWrite(irOutPin, LOW);
+    delay(5);
+    // read the analog in value:
+    sensorValueOff = analogRead(analogInPin);           
+    // perform measurement, turn IR LED on
+    digitalWrite(irOutPin, HIGH);
+    delay(5);
+    // read the analog in value:
+    sensorValueOn = analogRead(analogInPin);           
+
+    //Dynamische Verschiebung der Thresholds
+    Output = ETA * Mittelwert_silber + (sensorValueOn - sensorValueOff) * (1-ETA);
+    Mittelwert_silber= Output;
+    thres_1 = Mittelwert_silber - 30;  // untere Schwelle -> Auslösen -> rot ist da
+    thres_2 = Mittelwert_silber - 20;  // reset
+    
+    
+      if ((sensorValueOn - sensorValueOff) < thres_1 && red_mark_memory == 0 ){
+        // red mark is first time here
+
+        //bitte 4 stelliger nachkommastellen // am Zähler 64500,1 bedeutet  1000
+        stromzaehler_overall_nachkomma = stromzaehler_overall_nachkomma + 133;
+        
+        if (stromzaehler_overall_nachkomma > 10000) {
+            stromzaehler_overall_kwh = stromzaehler_overall_kwh + 1;
+            stromzaehler_overall_nachkomma = stromzaehler_overall_nachkomma - 10000;
+        }
+       
+        
+        red_mark_memory = 1;
+        delta_redmark = (currentMillis - redmark_last_millis)/1000;   //Zeit in sec seit letztem Red Mark
+        Serial.print("Zeit seit letztem RedMark in sec "); Serial.println(delta_redmark);
+
+        if (delta_redmark > 0 ) {
+          verbrauch_aktuell = 13 * 3600 / delta_redmark;
+          Serial.print("Aktueller Verbrauch in W "); Serial.println(verbrauch_aktuell);
+        }
+        
+         
+        redmark_last_millis = currentMillis;
+        
+        zaehler = String(stromzaehler_overall_kwh);
+        zaehler += F(".");
+        //Jetzt vierstellig machen
+        if (stromzaehler_overall_nachkomma < 1000) { zaehler += F("0");} 
+        if (stromzaehler_overall_nachkomma < 100) { zaehler += F("0");} 
+        if (stromzaehler_overall_nachkomma < 10) { zaehler += F("0");} 
+        zaehler += String(stromzaehler_overall_nachkomma);
+        dtostrf(verbrauch_aktuell,1,1,verbrauch);
+        
+        Serial.print("Kleiner Thres 1 "); Serial.print(thres_1); Serial.print(": ");
+        Serial.println(sensorValueOn - sensorValueOff);
+        
+        client.publish("fhem/power/mqtt_status","online", true);
+        
+        client.publish("fhem/power/power", zaehler.c_str(), true);
+        client.publish("fhem/power/verbrauch", verbrauch, true);
+        
+        Serial.print("MQTT connection...Zaehler...");Serial.println(zaehler);
+        Serial.print("MQTT connection...Verbrauch...");Serial.println(verbrauch);         
+      }
+
+       if ((sensorValueOn - sensorValueOff) > thres_2 && red_mark_memory == 1) {
+        Serial.print("Groesser Thres 2 "); Serial.print(thres_2); Serial.print(": ");
+        Serial.println(sensorValueOn - sensorValueOff);
+        red_mark_memory = 0;
+      }
+
+      
+// Ende: Messung mit IR Sensorik am Ferraris Zähler    
+
+  
+
+//Siganlstärke an LEDs anzeigen: gut fürs Einrichten
+digitalWrite(LED_red, LOW);
+digitalWrite(LED_yellow, LOW);
+digitalWrite(LED_blue, LOW);
+digitalWrite(LED_green, LOW);
+if ((sensorValueOn - sensorValueOff) <75) { digitalWrite(LED_red, HIGH); }
+if ((sensorValueOn - sensorValueOff) >75 && (sensorValueOn - sensorValueOff) < 100) { digitalWrite(LED_yellow, HIGH); }
+if ((sensorValueOn - sensorValueOff) >100 && (sensorValueOn - sensorValueOff) < 125) { digitalWrite(LED_blue, HIGH); }
+if ((sensorValueOn - sensorValueOff) >125) { digitalWrite(LED_green, HIGH); }
+//const int LED_green = 12;
+//const int LED_red = 5;
+//const int LED_blue = 0;
+//const int LED_yellow = 2;
+
+
+
+// Auführung... nicht bei jeden Durchgang der Loop
+  
+  if (currentMillis - previousMillis >= debug_cycle) {
+    previousMillis = currentMillis;
+    
+       String mqtt_debug;
+       mqtt_debug += F("Strom: Gesamtstand: ");
+       mqtt_debug += String(stromzaehler_overall_kwh);
+       mqtt_debug += F(".");
+       //Jetzt vierstellig machen
+       if (stromzaehler_overall_nachkomma < 1000) { zaehler += F("0");} 
+       if (stromzaehler_overall_nachkomma < 100) { zaehler += F("0");} 
+       if (stromzaehler_overall_nachkomma < 10) { zaehler += F("0");} 
+       mqtt_debug += String(stromzaehler_overall_nachkomma);
+       mqtt_debug += F(" IR Diff: ");
+       mqtt_debug += String((sensorValueOn - sensorValueOff));
+       //mqtt_debug += F(" Millis: ");
+       //mqtt_debug += String(currentMillis);
+       mqtt_debug += F(" mean_silver: ");
+       mqtt_debug += String(Mittelwert_silber,2);
+       mqtt_debug += F(" ETA: ");
+       mqtt_debug += String(ETA,6);
+       
+       Serial.println(mqtt_debug);  
+       client.publish("fhem/power/debug", mqtt_debug.c_str() , true);
+  }
+  //Sollte nicht immer passieren
+  //Write Zählerstand to EEPROM
+  //EEPROM.begin(512);
+  //EEPROM.put(40, flt_stromzaehler_overall);
+  //Serial.println("Written float data type to EEPROM!");
+  //Serial.print("Wrote "); Serial.println(flt_stromzaehler_overall);
+  //EEPROM.end();
+  
+ // String mqtt_debug;
+ // mqtt_debug += F("MQTT Debug: Gesamtstand: ");
+ // mqtt_debug += String(flt_stromzaehler_overall,4);
+ // mqtt_debug += F(" IR Diff: ");
+ // mqtt_debug += String((sensorValueOn - sensorValueOff));
+ // Serial.println(mqtt_debug);  
+ // client.publish("fhem/power/debug", mqtt_debug.c_str(), true);
+
+
+                      
+}
